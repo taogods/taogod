@@ -21,15 +21,18 @@ from typing import *
 import numpy as np
 import requests
 import time
+import yaml
 
 from neurons.classes import LabelledIssueTask
 from neurons.constants import DATA_ENDPOINT_BY_TASK
 from neurons.helpers import logger
 from neurons.problem_generation import generate_problem_statement
+from sweagent.environment.swe_env import EnvironmentArguments, SWEEnv
 from taogod.base.validator import BaseValidatorNeuron, TaskType
 from taogod.code_compare import new_compare
 from taogod.protocol import CodingTask
 from taogod.s3_utils import download_repo_locally
+from taogod.synthetic_testing import apply_patch, compare_test_results, run_tests
 from taogod.utils.uids import check_uid_availability
 
 
@@ -55,16 +58,63 @@ class Validator(BaseValidatorNeuron):
         challenge: LabelledIssueTask, 
         responses: List[str],
         codebase: Path,
+        test_patch: str,
     ) -> np.ndarray:
         """
         Validate the responses from the miners. This function should score the responses and return a list of rewards for each miner.
+
+        Args:
+            challenge (LabelledIssueTask): The challenge task.
+            responses (List[str]): The responses from the miners.
+            codebase (Path): The path to the codebase.
+            test_patch (str): The test patch to apply.
         """
         # TODO(MR.GAMMA)
-        return np.array([
+        llm_evals = np.array([
             new_compare(challenge.problem_statement, response, codebase)
             for response in responses
         ])
 
+        with open("env_setup.yaml", "w") as f:
+            yaml.safe_dump(challenge.environment_setup, f)
+
+        env_setup_path = Path.cwd() / "env_setup.yaml"
+
+        ## Synthetic testing
+        env = SWEEnv(
+            EnvironmentArguments(
+                image_name="sweagent/swe-agent:latest",
+                data_path="text://example.json", # Doesnt matter for tests
+                repo_path=str(codebase),
+                verbose=True,
+                environment_setup=str(env_setup_path),
+            )
+        )
+        _, _ = env.reset(0)
+
+        tests_before = run_tests(env)
+        synthetic_tests = []
+        for response in responses:
+            try:
+                env.reset(0)
+                apply_patch(env, test_patch)
+                apply_patch(env, response)
+
+                tests_after = run_tests(env)
+                results = compare_test_results(tests_before, tests_after)
+                synthetic_tests.append(results)
+            except Exception as e:
+                logger.exception("Error in synthetic rewards: ", e)
+                synthetic_tests.append(None)
+
+        syn_tests_arr = np.array([])
+        for test in synthetic_tests:
+            if test == None: np.append(syn_tests_arr, 0.0)
+            else:
+                syn_tests_arr = np.append(syn_tests_arr, int(len(test["PASS_TO_FAIL"]) == 0) + int(len(test["FAIL_TO_PASS"]) >= 0) + 3 * int(len(test["NEW_FAIL"]) == 0))
+
+        return llm_evals + syn_tests_arr
+    
     async def forward(self):
         """
         Validator forward pass. Consists of:
@@ -106,7 +156,9 @@ class Validator(BaseValidatorNeuron):
         logger.info(f"Parsed {task_type.__name__}. S3 url: {code_challenge.s3_repo_url}")
 
         local_path = download_repo_locally(code_challenge.s3_repo_url)
-        code_challenge.problem_statement = generate_problem_statement(local_path)
+        # Generate test patch and problem statement
+        # TODO: Yoruba
+        code_challenge.problem_statement, test_patch = generate_problem_statement(local_path)
         logger.info(f"Changed code_challenge.problem_statement to: {code_challenge.problem_statement}")
 
         logger.info(f"Sending task {code_challenge.s3_repo_url} to miners, ...")
@@ -144,15 +196,15 @@ class Validator(BaseValidatorNeuron):
             return
 
         logger.info(f"Running task-specific handlers for {task_type.__name__}")
-        await self.handle_synthetic_patch_response(code_challenge, finished_responses, working_miner_uids, local_path)
+        await self.handle_synthetic_patch_response(code_challenge, finished_responses, working_miner_uids, local_path, test_patch)
 
 
     async def handle_synthetic_patch_response(
-        self, code_challenge: LabelledIssueTask, finished_responses: List[str], working_miner_uids: List[int], local_path: Path
+        self, code_challenge: LabelledIssueTask, finished_responses: List[str], working_miner_uids: List[int], local_path: Path, test_patch: str,
     ) -> None:
         try:
             # TODO(MR.GAMMA)
-            rewards_list = await Validator.calculate_rewards(code_challenge, finished_responses, local_path)
+            rewards_list = await Validator.calculate_rewards(code_challenge, finished_responses, local_path, test_patch)
         except Exception:
             logger.exception("Error calculating rewards")
             return

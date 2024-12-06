@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import *
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import openai
@@ -186,7 +186,7 @@ def get_sample_files(local_repo: Path) -> List[File]:
     return [File(path=Path(f.path), contents=f.contents) for f in selected_file_pair.files]
 
 
-def generate_problem_statement(local_repo: Path) -> str:
+def generate_problem_statement(local_repo: Path) -> Tuple[str, str]:
     files = get_sample_files(local_repo)
     prompt = LLM_PROMPT_TMPL.render(
         dict(
@@ -201,4 +201,5 @@ def generate_problem_statement(local_repo: Path) -> str:
     )
     response = response_obj.choices[0].message.content
     logger.info(f"Generated problem statement: {response}")
-    return response
+    # TODO: YORUBA
+    return response, "test_patch"
