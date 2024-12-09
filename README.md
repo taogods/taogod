@@ -49,18 +49,18 @@ As the network grows, Cerebro evolves to efficiently transform problem statement
 
 **Objective**: Establish the foundational dataset for training Cerebro.
  
-- [ ] Launch a subnet that evaluates closed (issue, PR) pairs to build
+- [ ] Launch a subnet that evaluates (synthetic issue, miner solution) pairs to build
  training datasets.
 - [ ] Deploy `Taogod Twitter Bot` as the initial open-issue source.
 - [ ] Launch a website with observability tooling and a leaderboard.
 - [ ] Publish open-source dataset on HuggingFace.
+- [ ] Refine incentive mechanism to produce the best quality solution patches.
 
 **Epoch 2: Ground**
 
 **objective**: Expand the capabilities of Taogod and release Cerebro.
 
-- [ ] Integrate with Omega (SN24) for issue description generation from closed PRs. 
-- [ ] Introduce test-simulations using SWEBench into the evaluation pipeline.
+- [ ] Evaluate subnet against SWE-bench as proof of quality.
 - [ ] Release Cerebro issue classifier.
 - [ ] Expand open-issue sourcing across more Taogod repositories.
 
@@ -69,11 +69,11 @@ As the network grows, Cerebro evolves to efficiently transform problem statement
 **objective**: Foster a competitive market for open issues.
 
 - [ ] Develop and test a competition-based incentive model for the public 
- creation of high-quality (judged to Cerebro) open issues.
+ creation of high-quality (judged by Cerebro) open issues.
 - [ ] Fully integrate Cerebro into the reward model.
 - [ ] Incorporate non-Taogod issue sources into the platform.
 
-**Epoch 4: heaven**
+**Epoch 4: Space**
 
 **Objective**: Achieve a fully autonomous open-issue marketplace.
 

@@ -18,19 +18,44 @@ from datetime import timedelta
 from pathlib import Path
 from typing import *
 
+from aiohttp import BasicAuth, ClientSession
 import numpy as np
 import requests
 import time
+import yaml
+import os
+from concurrent.futures import ThreadPoolExecutor
+import math
 
 from neurons.classes import LabelledIssueTask
-from neurons.constants import DATA_ENDPOINT_BY_TASK
+from neurons.constants import DATA_ENDPOINT_BY_TASK, UPLOAD_ISSUE_ENDPOINT
 from neurons.helpers import logger
 from neurons.problem_generation import generate_problem_statement
+from sweagent.environment.swe_env import EnvironmentArguments, SWEEnv
 from taogod.base.validator import BaseValidatorNeuron, TaskType
 from taogod.code_compare import new_compare
 from taogod.protocol import CodingTask
 from taogod.s3_utils import download_repo_locally
+from taogod.synthetic_testing import apply_patch, compare_test_results, run_tests
 from taogod.utils.uids import check_uid_availability
+
+CODINGTASK_TIMEOUT_MINS: float = 30.0
+
+
+def exponential_decay(N, x):
+    """
+    Outputs a value that approaches 1 as x approaches 0 and approaches 0 as x approaches or exceeds N.
+
+    Parameters:
+    - N (int or float): The threshold value.
+    - x (int or float): The input value.
+
+    Returns:
+    - float: The output value.
+    """
+    if x >= N:
+        return 0
+    return math.exp(-x / (N - x))
 
 
 class Validator(BaseValidatorNeuron):
@@ -51,20 +76,134 @@ class Validator(BaseValidatorNeuron):
         # TODO(developer): Anything specific to your use case you can do here
 
     @staticmethod
+    def process_response_wrapper(args):
+        """
+        A wrapper function to handle multiprocessing safely.
+        Takes a tuple of arguments to pass to the `process_response` function.
+        """
+        response, env_args, test_patch, tests_before = args
+        try:
+            env = SWEEnv(env_args)
+            env.reset(0)
+            # Apply patches
+            apply_patch(env, test_patch)
+            apply_patch(env, response)
+
+            # Run tests after applying patches
+            tests_after = run_tests(env)
+
+            # Compare test results
+            results = compare_test_results(tests_before, tests_after)
+            return results
+        except Exception as e:
+            logger.exception(f"Error in synthetic rewards: {e}")
+            return None
+
+    @staticmethod
     async def calculate_rewards(
         challenge: LabelledIssueTask, 
         responses: List[str],
+        process_times: List[float],
         codebase: Path,
+        test_patch: str,
     ) -> np.ndarray:
         """
         Validate the responses from the miners. This function should score the responses and return a list of rewards for each miner.
+
+        Args:
+            challenge (LabelledIssueTask): The challenge task.
+            responses (List[str]): The responses from the miners.
+            codebase (Path): The path to the codebase.
+            test_patch (str): The test patch to apply.
         """
-        # TODO(MR.GAMMA)
-        return np.array([
+        llm_evals = np.array([
             new_compare(challenge.problem_statement, response, codebase)
             for response in responses
         ])
 
+        with open("env_setup.yaml", "w") as f:
+            yaml.safe_dump(challenge.environment_setup, f)
+
+        env_setup_path = Path.cwd() / "env_setup.yaml"
+
+        response_times = np.array([
+            exponential_decay(CODINGTASK_TIMEOUT_MINS*60, time)
+            for time in process_times
+        ])
+
+        ## Synthetic testing
+        env_args = EnvironmentArguments(
+                image_name="sweagent/swe-agent:latest",
+                data_path="text://example.json", # Doesnt matter for tests
+                repo_path=str(codebase),
+                verbose=True,
+                environment_setup=str(env_setup_path),
+            )
+        env = SWEEnv(env_args)
+        env.reset(0)
+
+        tests_before = run_tests(env)
+
+        # Share `tests_before` and other data across processes by making them part of the input arguments
+        tasks = [(response, env_args, test_patch, tests_before) for response in responses]
+
+        with ThreadPoolExecutor() as executor:
+            synthetic_tests = list(executor.map(Validator.process_response_wrapper, tasks))
+
+        syn_tests_arr = np.array([])
+        for test in synthetic_tests:
+            if test is None: np.append(syn_tests_arr, 0.0)
+            else:
+                syn_tests_arr = np.append(
+                    syn_tests_arr, 
+                    2 * int(len(test["PASS_TO_FAIL"]) == 0) 
+                    + int(len(test["FAIL_TO_PASS"]) >= 0) 
+                    + 3 * int(len(test["NEW_FAIL"]) == 0)
+                )
+
+        os.remove(env_setup_path)
+
+        return llm_evals + syn_tests_arr + response_times
+    
+    # TODO: Add more fields once components of scoring are named
+    async def upload_solution(
+            self,
+            problem_statement: str,
+            responses: List[str],
+            rewards_list: List[float],
+            hotkeys: List[str],
+    ):
+        """
+        Upload the closed issue to the data endpoint.
+        """
+        keypair = self.dendrite.keypair
+        hotkey = keypair.ss58_address
+        signature = f"0x{keypair.sign(hotkey).hex()}"
+        try:
+            async with ClientSession() as session:
+                # TODO: Add how long it takes to upload the issue
+                payload = [{
+                    "problem_statement": problem_statement,
+                    "solution_patch": response_patch,
+                    "score": response_score,
+                    "miner_hotkey": miner_hotkey,
+                } for
+                    response_patch,
+                    response_score,
+                    miner_hotkey
+                    in zip(responses, rewards_list, hotkeys)
+                ]
+                async with session.post(
+                    url=UPLOAD_ISSUE_ENDPOINT,
+                    auth=BasicAuth(hotkey, signature),
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    _result = await response.json()
+        except Exception:
+            logger.exception("Error uploading closed issue")
+        ...
+    
     async def forward(self):
         """
         Validator forward pass. Consists of:
@@ -106,7 +245,9 @@ class Validator(BaseValidatorNeuron):
         logger.info(f"Parsed {task_type.__name__}. S3 url: {code_challenge.s3_repo_url}")
 
         local_path = download_repo_locally(code_challenge.s3_repo_url)
-        code_challenge.problem_statement = generate_problem_statement(local_path)
+        # Generate test patch and problem statement
+        # TODO: Yoruba
+        code_challenge.problem_statement, test_patch = generate_problem_statement(local_path)
         logger.info(f"Changed code_challenge.problem_statement to: {code_challenge.problem_statement}")
 
         logger.info(f"Sending task {code_challenge.s3_repo_url} to miners, ...")
@@ -119,13 +260,14 @@ class Validator(BaseValidatorNeuron):
                 patch=None,
             ),
             deserialize=False,
-            timeout=timedelta(minutes=30).total_seconds(), # TODO: need a better timeout method
+            timeout=timedelta(minutes=CODINGTASK_TIMEOUT_MINS).total_seconds(), # TODO: need a better timeout method
         )
         logger.info(f"Received patches from miners for task {code_challenge.s3_repo_url}: "
                     f"{[(r.patch[:100] + '...' if r.patch else r.patch) for r in responses]}")
 
         working_miner_uids: List[int] = []
         finished_responses: List[str] = []
+        process_times: List[float] = []
 
         logger.info("Checking which received patches are valid...")
         for response in responses:
@@ -138,21 +280,41 @@ class Validator(BaseValidatorNeuron):
                 uid = next(uid for uid, axon in zip(miner_uids, axons) if axon.hotkey == response.axon.hotkey)
                 working_miner_uids.append(uid)
                 finished_responses.append(response.patch)
+                process_times.append(response.dendrite.process_time)
 
         if len(working_miner_uids) == 0:
             logger.info("No miners responded. Exiting forward pass...")
             return
+        
+        # TODO: Add punishment for miners who did not respond
 
         logger.info(f"Running task-specific handlers for {task_type.__name__}")
-        await self.handle_synthetic_patch_response(code_challenge, finished_responses, working_miner_uids, local_path)
+        await self.handle_synthetic_patch_response(
+            code_challenge, 
+            finished_responses, 
+            process_times,
+            working_miner_uids, 
+            local_path, 
+            test_patch
+        )
 
 
     async def handle_synthetic_patch_response(
-        self, code_challenge: LabelledIssueTask, finished_responses: List[str], working_miner_uids: List[int], local_path: Path
+        self, 
+        code_challenge: LabelledIssueTask, 
+        finished_responses: List[str],
+        process_times: List[float], 
+        working_miner_uids: List[int], 
+        local_path: Path, test_patch: str,
     ) -> None:
         try:
-            # TODO(MR.GAMMA)
-            rewards_list = await Validator.calculate_rewards(code_challenge, finished_responses, local_path)
+            rewards_list = await Validator.calculate_rewards(
+                code_challenge, 
+                finished_responses, 
+                process_times,
+                local_path, 
+                test_patch
+            )
         except Exception:
             logger.exception("Error calculating rewards")
             return
@@ -165,6 +327,17 @@ class Validator(BaseValidatorNeuron):
             working_miner_uids,
             TaskType.LABELLED_ISSUE
         )
+
+        try:
+            await self.upload_solution(
+                code_challenge.problem_statement,
+                finished_responses,
+                process_times,
+                rewards_list,
+                [self.metagraph.S[uid].hotkey for uid in working_miner_uids],
+            )
+        except Exception:
+            logger.exception("Error uploading solution")
 
 
 # The main function parses the configuration and runs the validator.
